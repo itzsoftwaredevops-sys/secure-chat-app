@@ -6,7 +6,7 @@ export const usersTable = pgTable("users", {
   id: text("id").primaryKey().$defaultFn(() => crypto.randomUUID()),
   username: text("username").notNull().unique(),
   email: text("email").notNull().unique(),
-  password: text("password").notNull(),
+  passwordHash: text("password_hash").notNull(),
   profilePicture: text("profile_picture"),
   isOnline: boolean("is_online").notNull().default(false),
   lastSeen: timestamp("last_seen"),

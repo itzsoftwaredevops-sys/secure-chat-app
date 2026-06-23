@@ -59,7 +59,7 @@ router.post("/auth/register", async (req, res) => {
 
     const [user] = await db
       .insert(usersTable)
-      .values({ username, email, password: hashedPassword, profilePicture: profilePicture ?? null })
+      .values({ username, email, passwordHash: hashedPassword, profilePicture: profilePicture ?? null })
       .returning();
 
     const token = generateToken(user.id);
@@ -85,7 +85,7 @@ router.post("/auth/login", async (req, res) => {
       .where(eq(usersTable.email, email))
       .limit(1);
 
-    if (!user || !(await bcrypt.compare(password, user.password))) {
+    if (!user || !(await bcrypt.compare(password, user.passwordHash))) {
       res.status(401).json({ error: "Invalid email or password" });
       return;
     }
