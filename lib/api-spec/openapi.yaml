@@ -209,6 +209,36 @@ paths:
                 items:
                   $ref: "#/components/schemas/Message"
 
+  /messages/search:
+    get:
+      operationId: searchMessages
+      tags: [messages]
+      summary: Search through the current user's message history
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: q
+          in: query
+          required: true
+          schema:
+            type: string
+          description: Keyword to search for in decrypted message content
+      responses:
+        "200":
+          description: List of matching messages with context
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/SearchResult"
+        "400":
+          description: Missing query
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+
   /messages:
     post:
       operationId: sendMessage
