@@ -1,6 +1,5 @@
 import type { Request, Response, NextFunction } from "express";
 import jwt from "jsonwebtoken";
-import { UserModel } from "../models/User.js";
 
 const JWT_SECRET = process.env.JWT_SECRET ?? "fallback-dev-secret-change-in-prod";
 
@@ -34,5 +33,3 @@ export function authMiddleware(
 export function generateToken(userId: string): string {
   return jwt.sign({ userId }, JWT_SECRET, { expiresIn: "7d" });
 }
-
-export { UserModel };

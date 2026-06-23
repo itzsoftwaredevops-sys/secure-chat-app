@@ -1,8 +1,12 @@
 import { Router, type IRouter } from "express";
 import { z } from "zod";
-import { UserModel } from "../models/User.js";
+import bcrypt from "bcryptjs";
+import { db } from "../lib/db.js";
+import { usersTable } from "@workspace/db";
+import { eq, or } from "drizzle-orm";
 import { generateToken, authMiddleware, type AuthRequest } from "../middlewares/auth.js";
 import { logger } from "../lib/logger.js";
+import type { User } from "@workspace/db";
 
 const router: IRouter = Router();
 
@@ -18,15 +22,15 @@ const loginSchema = z.object({
   password: z.string().min(1),
 });
 
-function formatUser(user: InstanceType<typeof UserModel>) {
+export function formatUser(user: User) {
   return {
-    id: user._id.toString(),
+    id: user.id,
     username: user.username,
     email: user.email,
     profilePicture: user.profilePicture ?? null,
     isOnline: user.isOnline,
     lastSeen: user.lastSeen ? user.lastSeen.toISOString() : null,
-    createdAt: (user as any).createdAt?.toISOString?.() ?? new Date().toISOString(),
+    createdAt: user.createdAt.toISOString(),
   };
 }
 
@@ -40,20 +44,25 @@ router.post("/auth/register", async (req, res) => {
 
     const { username, email, password, profilePicture } = body.data;
 
-    const existing = await UserModel.findOne({ $or: [{ email }, { username }] });
-    if (existing) {
+    const existing = await db
+      .select()
+      .from(usersTable)
+      .where(or(eq(usersTable.email, email), eq(usersTable.username, username)))
+      .limit(1);
+
+    if (existing.length > 0) {
       res.status(400).json({ error: "Username or email already taken" });
       return;
     }
 
-    const user = await UserModel.create({
-      username,
-      email,
-      password,
-      profilePicture: profilePicture ?? null,
-    });
+    const hashedPassword = await bcrypt.hash(password, 12);
 
-    const token = generateToken(user._id.toString());
+    const [user] = await db
+      .insert(usersTable)
+      .values({ username, email, password: hashedPassword, profilePicture: profilePicture ?? null })
+      .returning();
+
+    const token = generateToken(user.id);
     res.status(201).json({ token, user: formatUser(user) });
   } catch (err) {
     logger.error({ err }, "Register error");
@@ -70,18 +79,24 @@ router.post("/auth/login", async (req, res) => {
     }
 
     const { email, password } = body.data;
-    const user = await UserModel.findOne({ email });
+    const [user] = await db
+      .select()
+      .from(usersTable)
+      .where(eq(usersTable.email, email))
+      .limit(1);
 
-    if (!user || !(await user.comparePassword(password))) {
+    if (!user || !(await bcrypt.compare(password, user.password))) {
       res.status(401).json({ error: "Invalid email or password" });
       return;
     }
 
-    user.isOnline = true;
-    await user.save();
+    await db
+      .update(usersTable)
+      .set({ isOnline: true })
+      .where(eq(usersTable.id, user.id));
 
-    const token = generateToken(user._id.toString());
-    res.json({ token, user: formatUser(user) });
+    const token = generateToken(user.id);
+    res.json({ token, user: formatUser({ ...user, isOnline: true }) });
   } catch (err) {
     logger.error({ err }, "Login error");
     res.status(500).json({ error: "Internal server error" });
@@ -90,7 +105,12 @@ router.post("/auth/login", async (req, res) => {
 
 router.get("/auth/me", authMiddleware, async (req: AuthRequest, res) => {
   try {
-    const user = await UserModel.findById(req.userId);
+    const [user] = await db
+      .select()
+      .from(usersTable)
+      .where(eq(usersTable.id, req.userId!))
+      .limit(1);
+
     if (!user) {
       res.status(401).json({ error: "User not found" });
       return;
@@ -102,5 +122,4 @@ router.get("/auth/me", authMiddleware, async (req: AuthRequest, res) => {
   }
 });
 
-export { formatUser };
 export default router;

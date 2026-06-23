@@ -1,7 +1,7 @@
 import { Router, type IRouter } from "express";
-import mongoose from "mongoose";
-import { MessageModel } from "../models/Message.js";
-import { UserModel } from "../models/User.js";
+import { db } from "../lib/db.js";
+import { messagesTable, usersTable } from "@workspace/db";
+import { eq, or, desc } from "drizzle-orm";
 import { authMiddleware, type AuthRequest } from "../middlewares/auth.js";
 import { formatUser } from "./auth.js";
 import { formatMessage } from "./messages.js";
@@ -11,37 +11,45 @@ const router: IRouter = Router();
 
 router.get("/conversations", authMiddleware, async (req: AuthRequest, res) => {
   try {
-    const currentUserId = new mongoose.Types.ObjectId(req.userId);
+    const currentUserId = req.userId!;
 
-    const messages = await MessageModel.find({
-      $or: [{ senderId: currentUserId }, { receiverId: currentUserId }],
-    }).sort({ createdAt: -1 });
+    const messages = await db
+      .select()
+      .from(messagesTable)
+      .where(
+        or(
+          eq(messagesTable.senderId, currentUserId),
+          eq(messagesTable.receiverId, currentUserId),
+        ),
+      )
+      .orderBy(desc(messagesTable.createdAt));
 
     const conversationMap = new Map<
       string,
-      { lastMessage: InstanceType<typeof MessageModel>; unreadCount: number }
+      { lastMessage: (typeof messages)[0]; unreadCount: number }
     >();
 
     for (const msg of messages) {
       const otherId =
-        msg.senderId.toString() === req.userId
-          ? msg.receiverId.toString()
-          : msg.senderId.toString();
+        msg.senderId === currentUserId ? msg.receiverId : msg.senderId;
 
       if (!conversationMap.has(otherId)) {
         conversationMap.set(otherId, { lastMessage: msg, unreadCount: 0 });
       }
 
-      if (!msg.isRead && msg.receiverId.toString() === req.userId) {
-        const entry = conversationMap.get(otherId)!;
-        entry.unreadCount += 1;
+      if (!msg.isRead && msg.receiverId === currentUserId) {
+        conversationMap.get(otherId)!.unreadCount += 1;
       }
     }
 
     const conversations = await Promise.all(
       Array.from(conversationMap.entries()).map(
         async ([otherId, { lastMessage, unreadCount }]) => {
-          const user = await UserModel.findById(otherId);
+          const [user] = await db
+            .select()
+            .from(usersTable)
+            .where(eq(usersTable.id, otherId))
+            .limit(1);
           if (!user) return null;
           return {
             user: formatUser(user),

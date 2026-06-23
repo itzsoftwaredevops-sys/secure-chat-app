@@ -1,10 +1,12 @@
 import { Router, type IRouter } from "express";
-import mongoose from "mongoose";
 import { z } from "zod";
-import { MessageModel } from "../models/Message.js";
+import { db } from "../lib/db.js";
+import { messagesTable } from "@workspace/db";
+import { eq, and, or } from "drizzle-orm";
 import { authMiddleware, type AuthRequest } from "../middlewares/auth.js";
 import { encryptMessage, decryptMessage } from "../lib/encryption.js";
 import { logger } from "../lib/logger.js";
+import type { Message } from "@workspace/db";
 
 const router: IRouter = Router();
 
@@ -14,32 +16,41 @@ const sendMessageSchema = z.object({
   timer: z.number().int().positive().nullable().optional(),
 });
 
-function formatMessage(msg: InstanceType<typeof MessageModel>) {
-  const plainText = decryptMessage(msg.encryptedMessage);
+export function formatMessage(msg: Message) {
   return {
-    id: msg._id.toString(),
-    senderId: msg.senderId.toString(),
-    receiverId: msg.receiverId.toString(),
+    id: msg.id,
+    senderId: msg.senderId,
+    receiverId: msg.receiverId,
     encryptedMessage: msg.encryptedMessage,
-    plainText: plainText || null,
+    plainText: decryptMessage(msg.encryptedMessage) || null,
     timer: msg.timer ?? null,
     expiresAt: msg.expiresAt ? msg.expiresAt.toISOString() : null,
     isRead: msg.isRead,
-    createdAt: (msg as any).createdAt?.toISOString?.() ?? new Date().toISOString(),
+    createdAt: msg.createdAt.toISOString(),
   };
 }
 
 router.get("/messages/:userId", authMiddleware, async (req: AuthRequest, res) => {
   try {
-    const currentUserId = new mongoose.Types.ObjectId(req.userId);
-    const otherUserId = new mongoose.Types.ObjectId(req.params["userId"] as string);
+    const currentUserId = req.userId!;
+    const otherUserId = req.params["userId"] as string;
 
-    const messages = await MessageModel.find({
-      $or: [
-        { senderId: currentUserId, receiverId: otherUserId },
-        { senderId: otherUserId, receiverId: currentUserId },
-      ],
-    }).sort({ createdAt: 1 });
+    const messages = await db
+      .select()
+      .from(messagesTable)
+      .where(
+        or(
+          and(
+            eq(messagesTable.senderId, currentUserId),
+            eq(messagesTable.receiverId, otherUserId),
+          ),
+          and(
+            eq(messagesTable.senderId, otherUserId),
+            eq(messagesTable.receiverId, currentUserId),
+          ),
+        ),
+      )
+      .orderBy(messagesTable.createdAt);
 
     res.json(messages.map(formatMessage));
   } catch (err) {
@@ -57,21 +68,22 @@ router.post("/messages", authMiddleware, async (req: AuthRequest, res) => {
     }
 
     const { receiverId, message, timer } = body.data;
-    const encryptedMessage = encryptMessage(message);
+    const encrypted = encryptMessage(message);
 
-    let expiresAt: Date | null = null;
-    if (timer && timer > 0) {
-      expiresAt = new Date(Date.now() + timer * 1000);
-    }
+    const expiresAt = timer && timer > 0
+      ? new Date(Date.now() + timer * 1000)
+      : null;
 
-    const msg = await MessageModel.create({
-      senderId: new mongoose.Types.ObjectId(req.userId),
-      receiverId: new mongoose.Types.ObjectId(receiverId),
-      encryptedMessage,
-      timer: timer ?? null,
-      expiresAt,
-      isRead: false,
-    });
+    const [msg] = await db
+      .insert(messagesTable)
+      .values({
+        senderId: req.userId!,
+        receiverId,
+        encryptedMessage: encrypted,
+        timer: timer ?? null,
+        expiresAt,
+      })
+      .returning();
 
     const formatted = formatMessage(msg);
 
@@ -90,17 +102,21 @@ router.post("/messages", authMiddleware, async (req: AuthRequest, res) => {
 
 router.patch("/messages/:id/read", authMiddleware, async (req: AuthRequest, res) => {
   try {
-    const msg = await MessageModel.findOneAndUpdate(
-      { _id: req.params["id"], receiverId: new mongoose.Types.ObjectId(req.userId) },
-      { isRead: true },
-      { new: true },
-    );
+    const [msg] = await db
+      .update(messagesTable)
+      .set({ isRead: true })
+      .where(
+        and(
+          eq(messagesTable.id, req.params["id"] as string),
+          eq(messagesTable.receiverId, req.userId!),
+        ),
+      )
+      .returning();
 
     if (!msg) {
       res.status(404).json({ error: "Message not found" });
       return;
     }
-
     res.json(formatMessage(msg));
   } catch (err) {
     logger.error({ err }, "MarkMessageRead error");
@@ -110,13 +126,18 @@ router.patch("/messages/:id/read", authMiddleware, async (req: AuthRequest, res)
 
 router.delete("/messages/:id", authMiddleware, async (req: AuthRequest, res) => {
   try {
-    const msg = await MessageModel.findOneAndDelete({
-      _id: req.params["id"],
-      $or: [
-        { senderId: new mongoose.Types.ObjectId(req.userId) },
-        { receiverId: new mongoose.Types.ObjectId(req.userId) },
-      ],
-    });
+    const [msg] = await db
+      .delete(messagesTable)
+      .where(
+        and(
+          eq(messagesTable.id, req.params["id"] as string),
+          or(
+            eq(messagesTable.senderId, req.userId!),
+            eq(messagesTable.receiverId, req.userId!),
+          ),
+        ),
+      )
+      .returning();
 
     if (!msg) {
       res.status(404).json({ error: "Message not found" });
@@ -125,8 +146,8 @@ router.delete("/messages/:id", authMiddleware, async (req: AuthRequest, res) => 
 
     const io = (req as any).io;
     if (io) {
-      io.to(msg.senderId.toString()).emit("messageExpired", { id: req.params["id"] });
-      io.to(msg.receiverId.toString()).emit("messageExpired", { id: req.params["id"] });
+      io.to(msg.senderId).emit("messageExpired", { id: msg.id });
+      io.to(msg.receiverId).emit("messageExpired", { id: msg.id });
     }
 
     res.json({ success: true, message: "Message deleted" });
@@ -136,5 +157,4 @@ router.delete("/messages/:id", authMiddleware, async (req: AuthRequest, res) => 
   }
 });
 
-export { formatMessage };
 export default router;
