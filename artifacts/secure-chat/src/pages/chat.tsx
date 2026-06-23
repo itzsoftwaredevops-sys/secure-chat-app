@@ -1,4 +1,4 @@
-import React, { useEffect, useState, useRef } from "react";
+import React, { useEffect, useState, useRef, useCallback } from "react";
 import {
   useGetMe,
   useGetConversations,
@@ -16,63 +16,78 @@ import { Button } from "@/components/ui/button";
 import { ScrollArea } from "@/components/ui/scroll-area";
 import { Avatar, AvatarFallback, AvatarImage } from "@/components/ui/avatar";
 import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
-import { Shield, Clock, Send, Search, Check, CheckCheck, User as UserIcon, LogOut } from "lucide-react";
+import {
+  Shield, Clock, Send, Search, Check, CheckCheck,
+  User as UserIcon, ArrowLeft, Menu,
+} from "lucide-react";
 import { io, Socket } from "socket.io-client";
-import type { Message, User } from "@workspace/api-client-react/src/generated/api.schemas";
+import { useQueryClient } from "@tanstack/react-query";
+import type { Message, User } from "@workspace/api-client-react";
 
 export default function ChatPage() {
   const { data: me } = useGetMe();
+  const queryClient = useQueryClient();
+
   const [selectedUserId, setSelectedUserId] = useState<string | null>(null);
+  const selectedUserIdRef = useRef<string | null>(null);
   const [searchQuery, setSearchQuery] = useState("");
   const [messageInput, setMessageInput] = useState("");
   const [timer, setTimer] = useState<number | null>(null);
+  const [showSidebar, setShowSidebar] = useState(true);
   const scrollRef = useRef<HTMLDivElement>(null);
-  
-  // Sockets
+
+  // Sockets — stable connection, never reconnects
   const socketRef = useRef<Socket | null>(null);
+  const typingTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const [onlineUsers, setOnlineUsers] = useState<Set<string>>(new Set());
   const [typingUsers, setTypingUsers] = useState<Set<string>>(new Set());
+  const [expiredIds, setExpiredIds] = useState<Set<string>>(new Set());
 
-  // Queries
-  const { data: onlineUsersData } = useGetOnlineUsers({
-    query: { refetchInterval: 5000 }
-  });
+  // Keep ref in sync so socket callbacks can read current value without re-subscribing
+  useEffect(() => {
+    selectedUserIdRef.current = selectedUserId;
+  }, [selectedUserId]);
 
-  const { data: conversations = [] } = useGetConversations({
-    query: { refetchInterval: 3000 }
-  });
-  
-  const { data: messages = [], refetch: refetchMessages } = useGetMessages(selectedUserId!, {
-    query: { 
-      enabled: !!selectedUserId,
-      refetchInterval: 2000
-    }
-  });
-
-  const { data: searchResults = [] } = useGetUsers(
-    { search: searchQuery },
-    { query: { enabled: searchQuery.length > 1 } }
+  // Queries — sockets handle real-time; polling kept short as a fallback
+  const { data: onlineUsersData } = useGetOnlineUsers(
+    { query: { refetchInterval: 15000 } as any },
   );
+
+  const { data: conversations = [], refetch: refetchConversations } = useGetConversations(
+    { query: { refetchInterval: 8000 } as any },
+  );
+
+  const { data: messages = [], refetch: refetchMessages } = useGetMessages(selectedUserId!, {
+    query: { enabled: !!selectedUserId } as any,
+  });
 
   const sendMessageMutation = useSendMessage();
   const markReadMutation = useMarkMessageRead();
   const deleteMessageMutation = useDeleteMessage();
 
+  // Seed online users from REST poll
   useEffect(() => {
-    if (messages.length > 0 && selectedUserId) {
-      const unreadMessages = messages.filter(m => !m.isRead && m.senderId === selectedUserId);
-      unreadMessages.forEach(m => {
-        markReadMutation.mutate({ id: m.id });
-      });
-    }
-  }, [messages, selectedUserId]);
-
-  useEffect(() => {
-    if (onlineUsersData) {
+    if (onlineUsersData?.onlineUserIds) {
       setOnlineUsers(new Set(onlineUsersData.onlineUserIds));
     }
   }, [onlineUsersData]);
 
+  // Mark incoming messages as read when conversation opens
+  useEffect(() => {
+    if (!messages.length || !selectedUserId) return;
+    messages
+      .filter((m) => !m.isRead && m.senderId === selectedUserId)
+      .forEach((m) => markReadMutation.mutate({ id: m.id }));
+  }, [messages, selectedUserId]);
+
+  // Auto-scroll to bottom
+  useEffect(() => {
+    if (scrollRef.current) {
+      scrollRef.current.scrollTop = scrollRef.current.scrollHeight;
+    }
+  }, [messages, expiredIds]);
+
+  // Socket — connect ONCE on mount, never reconnect
   useEffect(() => {
     const token = localStorage.getItem("chat_token");
     if (!token) return;
@@ -80,83 +95,99 @@ export default function ChatPage() {
     const socket = io("/", {
       path: "/socket.io",
       auth: { token },
-      transports: ["websocket"]
+      transports: ["websocket"],
     });
-    
     socketRef.current = socket;
 
-    socket.on("connect", () => {
-      socket.emit("joinRoom");
+    socket.on("userOnline", ({ userId }: { userId: string }) => {
+      setOnlineUsers((prev) => new Set(prev).add(userId));
     });
 
-    socket.on("userOnline", ({ userId }) => {
-      setOnlineUsers(prev => new Set(prev).add(userId));
+    socket.on("userOffline", ({ userId }: { userId: string }) => {
+      setOnlineUsers((prev) => { const n = new Set(prev); n.delete(userId); return n; });
     });
 
-    socket.on("userOffline", ({ userId }) => {
-      setOnlineUsers(prev => {
-        const next = new Set(prev);
-        next.delete(userId);
-        return next;
-      });
-    });
-
-    socket.on("typing", ({ userId }) => {
-      setTypingUsers(prev => new Set(prev).add(userId));
-      // Auto clear typing after 3s
+    socket.on("typing", ({ userId }: { userId: string }) => {
+      setTypingUsers((prev) => new Set(prev).add(userId));
       setTimeout(() => {
-        setTypingUsers(prev => {
-          const next = new Set(prev);
-          next.delete(userId);
-          return next;
-        });
+        setTypingUsers((prev) => { const n = new Set(prev); n.delete(userId); return n; });
       }, 3000);
     });
 
-    socket.on("newMessage", () => {
-      if (selectedUserId) refetchMessages();
+    // New message — refresh only the active conversation
+    socket.on("newMessage", (msg: Message) => {
+      const active = selectedUserIdRef.current;
+      const isRelevant =
+        active && (msg.senderId === active || msg.receiverId === active);
+      if (isRelevant) {
+        refetchMessages();
+      }
+      refetchConversations();
+    });
+
+    // Server confirmed a message was deleted (expired or manual)
+    socket.on("messageExpired", ({ id }: { id: string }) => {
+      setExpiredIds((prev) => new Set(prev).add(id));
+      refetchConversations();
     });
 
     return () => {
       socket.disconnect();
+      socketRef.current = null;
     };
-  }, [selectedUserId, refetchMessages]);
-
-  useEffect(() => {
-    if (scrollRef.current) {
-      scrollRef.current.scrollTop = scrollRef.current.scrollHeight;
-    }
-  }, [messages]);
+  }, []); // eslint-disable-line react-hooks/exhaustive-deps
 
   const handleSendMessage = (e: React.FormEvent) => {
     e.preventDefault();
     if (!messageInput.trim() || !selectedUserId) return;
-
-    sendMessageMutation.mutate({
-      data: {
-        receiverId: selectedUserId,
-        message: messageInput,
-        timer: timer
-      }
-    }, {
-      onSuccess: () => {
-        setMessageInput("");
-        refetchMessages();
-      }
-    });
+    const text = messageInput;
+    setMessageInput("");
+    sendMessageMutation.mutate(
+      { data: { receiverId: selectedUserId, message: text, timer } },
+      { onSuccess: () => refetchMessages() },
+    );
   };
 
-  const handleTyping = () => {
-    if (socketRef.current && selectedUserId) {
-      socketRef.current.emit("typing", { receiverId: selectedUserId });
-    }
+  const handleTyping = useCallback(() => {
+    if (!socketRef.current || !selectedUserId) return;
+    socketRef.current.emit("typing", { receiverId: selectedUserId });
+
+    if (typingTimeoutRef.current) clearTimeout(typingTimeoutRef.current);
+    typingTimeoutRef.current = setTimeout(() => {
+      socketRef.current?.emit("stopTyping", { receiverId: selectedUserId });
+    }, 2000);
+  }, [selectedUserId]);
+
+  const handleSelectUser = (userId: string) => {
+    setSelectedUserId(userId);
+    setSearchQuery("");
+    setShowSidebar(false); // on mobile, hide sidebar when chat opens
   };
+
+  const handleExpireMessage = useCallback(
+    (id: string) => {
+      setExpiredIds((prev) => new Set(prev).add(id));
+      deleteMessageMutation.mutate({ id });
+    },
+    [deleteMessageMutation],
+  );
+
+  const selectedUser = conversations.find((c) => c.user.id === selectedUserId)?.user;
+  const visibleMessages = messages.filter((m) => !expiredIds.has(m.id));
 
   return (
     <div className="flex h-screen w-full bg-background text-foreground overflow-hidden">
-      {/* Sidebar */}
-      <div className="w-80 border-r border-border flex flex-col bg-card flex-shrink-0">
-        <div className="p-4 border-b border-border flex items-center justify-between">
+      {/* ── Sidebar ── */}
+      <div
+        className={`
+          flex flex-col bg-card border-r border-border
+          w-full md:w-80 md:flex flex-shrink-0
+          ${showSidebar ? "flex" : "hidden"}
+          md:flex
+        `}
+      >
+        {/* Header */}
+        <div className="p-4 border-b border-border flex items-center justify-between shrink-0">
           <div className="flex items-center gap-2 text-primary font-bold">
             <Shield className="w-5 h-5" />
             <span>SecureChat</span>
@@ -165,12 +196,13 @@ export default function ChatPage() {
             <UserIcon className="w-5 h-5 text-muted-foreground" />
           </Link>
         </div>
-        
-        <div className="p-4">
+
+        {/* Search */}
+        <div className="p-4 shrink-0">
           <div className="relative">
             <Search className="w-4 h-4 absolute left-3 top-1/2 -translate-y-1/2 text-muted-foreground" />
-            <Input 
-              placeholder="Search operatives..." 
+            <Input
+              placeholder="Search operatives..."
               className="pl-9 bg-background border-border"
               value={searchQuery}
               onChange={(e) => setSearchQuery(e.target.value)}
@@ -178,101 +210,88 @@ export default function ChatPage() {
           </div>
         </div>
 
+        {/* Conversation / Search list */}
         <ScrollArea className="flex-1">
           {searchQuery.length > 1 ? (
-            <div className="p-2">
-              <div className="text-xs text-muted-foreground mb-2 px-2 uppercase tracking-wider font-semibold">Search Results</div>
-              {searchResults.map(user => (
-                <button
-                  key={user.id}
-                  onClick={() => { setSelectedUserId(user.id); setSearchQuery(""); }}
-                  className="w-full flex items-center gap-3 p-3 hover:bg-muted rounded-lg transition-colors text-left"
-                >
-                  <Avatar>
-                    <AvatarImage src={user.profilePicture || ""} />
-                    <AvatarFallback>{user.username.slice(0, 2).toUpperCase()}</AvatarFallback>
-                  </Avatar>
-                  <div className="flex-1 overflow-hidden">
-                    <div className="font-medium truncate">{user.username}</div>
-                  </div>
-                </button>
-              ))}
-            </div>
+            <SearchList results={conversations.map((c) => c.user)} query={searchQuery} onSelect={handleSelectUser} />
           ) : (
-            <div className="p-2">
-              {conversations.map((conv) => {
-                const isSelected = selectedUserId === conv.user.id;
-                const isOnline = onlineUsers.has(conv.user.id) || conv.user.isOnline;
-                return (
-                  <button
-                    key={conv.user.id}
-                    onClick={() => setSelectedUserId(conv.user.id)}
-                    className={`w-full flex items-center gap-3 p-3 rounded-lg transition-colors text-left mb-1 ${isSelected ? "bg-primary/10 border border-primary/20" : "hover:bg-muted border border-transparent"}`}
-                  >
-                    <div className="relative">
-                      <Avatar>
-                        <AvatarImage src={conv.user.profilePicture || ""} />
-                        <AvatarFallback>{conv.user.username.slice(0, 2).toUpperCase()}</AvatarFallback>
-                      </Avatar>
-                      {isOnline && (
-                        <div className="absolute bottom-0 right-0 w-3 h-3 bg-green-500 border-2 border-card rounded-full" />
-                      )}
-                    </div>
-                    <div className="flex-1 overflow-hidden">
-                      <div className="flex justify-between items-center">
-                        <span className="font-medium truncate">{conv.user.username}</span>
-                        {conv.lastMessage && (
-                          <span className="text-xs text-muted-foreground">
-                            {format(new Date(conv.lastMessage.createdAt), "HH:mm")}
-                          </span>
-                        )}
-                      </div>
-                      <div className="flex justify-between items-center mt-1">
-                        <span className="text-sm text-muted-foreground truncate">
-                          {conv.lastMessage?.plainText || (conv.lastMessage ? "[Encrypted]" : "No messages")}
-                        </span>
-                        {conv.unreadCount > 0 && (
-                          <span className="bg-primary text-primary-foreground text-xs font-bold px-2 py-0.5 rounded-full">
-                            {conv.unreadCount}
-                          </span>
-                        )}
-                      </div>
-                    </div>
-                  </button>
-                );
-              })}
-            </div>
+            <ConversationList
+              conversations={conversations}
+              selectedUserId={selectedUserId}
+              onlineUsers={onlineUsers}
+              onSelect={handleSelectUser}
+            />
           )}
         </ScrollArea>
       </div>
 
-      {/* Main Chat Area */}
-      <div className="flex-1 flex flex-col bg-background relative">
+      {/* ── Main chat area ── */}
+      <div
+        className={`
+          flex-1 flex flex-col bg-background relative
+          ${!showSidebar ? "flex" : "hidden"}
+          md:flex
+        `}
+      >
         {selectedUserId ? (
           <>
-            {/* Chat Header */}
-            <div className="h-16 border-b border-border flex items-center px-6 bg-card shrink-0">
-              <div className="font-semibold flex items-center gap-2">
-                <span>Chat</span>
-                <span className="text-muted-foreground font-normal text-sm">|</span>
-                <span className="text-primary tracking-wide">{conversations.find(c => c.user.id === selectedUserId)?.user.username || "Operative"}</span>
+            {/* Header */}
+            <div className="h-16 border-b border-border flex items-center px-4 bg-card shrink-0 gap-3">
+              <button
+                className="md:hidden p-2 hover:bg-muted rounded-full transition-colors"
+                onClick={() => setShowSidebar(true)}
+              >
+                <ArrowLeft className="w-5 h-5 text-muted-foreground" />
+              </button>
+              <div className="flex items-center gap-3 flex-1 min-w-0">
+                <div className="relative">
+                  <Avatar className="w-9 h-9">
+                    <AvatarImage src={selectedUser?.profilePicture || ""} />
+                    <AvatarFallback>{selectedUser?.username.slice(0, 2).toUpperCase() ?? "??"}</AvatarFallback>
+                  </Avatar>
+                  {selectedUser && onlineUsers.has(selectedUser.id) && (
+                    <div className="absolute bottom-0 right-0 w-2.5 h-2.5 bg-green-500 border-2 border-card rounded-full" />
+                  )}
+                </div>
+                <div className="min-w-0">
+                  <div className="font-semibold truncate">
+                    {selectedUser?.username ?? "Operative"}
+                  </div>
+                  <div className="text-xs text-muted-foreground">
+                    {selectedUser && onlineUsers.has(selectedUser.id) ? (
+                      <span className="text-green-400">Online</span>
+                    ) : (
+                      "Offline"
+                    )}
+                  </div>
+                </div>
               </div>
             </div>
 
             {/* Messages */}
-            <div className="flex-1 overflow-y-auto p-6" ref={scrollRef}>
-              <div className="space-y-4">
-                {messages.map((msg: Message) => {
-                  const isMe = msg.senderId === me?.id;
-                  return <MessageBubble key={msg.id} msg={msg} isMe={isMe} />;
-                })}
+            <div className="flex-1 overflow-y-auto p-4 md:p-6" ref={scrollRef}>
+              <div className="space-y-3">
+                {visibleMessages.map((msg) => (
+                  <MessageBubble
+                    key={msg.id}
+                    msg={msg}
+                    isMe={msg.senderId === me?.id}
+                    onExpire={handleExpireMessage}
+                  />
+                ))}
               </div>
+
+              {/* Typing indicator */}
               {typingUsers.has(selectedUserId) && (
                 <div className="mt-4 text-sm text-muted-foreground italic flex items-center gap-2">
                   <div className="flex gap-1">
-                    <span className="w-1.5 h-1.5 bg-primary rounded-full animate-bounce" style={{ animationDelay: "0ms" }} />
-                    <span className="w-1.5 h-1.5 bg-primary rounded-full animate-bounce" style={{ animationDelay: "150ms" }} />
-                    <span className="w-1.5 h-1.5 bg-primary rounded-full animate-bounce" style={{ animationDelay: "300ms" }} />
+                    {[0, 150, 300].map((delay) => (
+                      <span
+                        key={delay}
+                        className="w-1.5 h-1.5 bg-primary rounded-full animate-bounce"
+                        style={{ animationDelay: `${delay}ms` }}
+                      />
+                    ))}
                   </div>
                   Incoming transmission...
                 </div>
@@ -280,47 +299,65 @@ export default function ChatPage() {
             </div>
 
             {/* Input */}
-            <div className="p-4 border-t border-border bg-card shrink-0">
+            <div className="p-3 md:p-4 border-t border-border bg-card shrink-0">
               <form onSubmit={handleSendMessage} className="flex items-center gap-2">
                 <Popover>
                   <PopoverTrigger asChild>
-                    <Button variant="outline" size="icon" className={`shrink-0 ${timer ? "text-primary border-primary/50" : ""}`}>
+                    <Button
+                      type="button"
+                      variant="outline"
+                      size="icon"
+                      className={`shrink-0 ${timer ? "text-primary border-primary/50" : ""}`}
+                    >
                       <Clock className="w-5 h-5" />
                     </Button>
                   </PopoverTrigger>
-                  <PopoverContent className="w-48 p-2" side="top">
-                    <div className="text-xs font-semibold mb-2 text-muted-foreground uppercase">Self-destruct timer</div>
+                  <PopoverContent className="w-44 p-2" side="top">
+                    <div className="text-xs font-semibold mb-2 text-muted-foreground uppercase">
+                      Self-destruct timer
+                    </div>
                     <div className="grid grid-cols-2 gap-1">
-                      {[null, 10, 30, 60, 300].map(t => (
+                      {([null, 10, 30, 60, 300] as const).map((t) => (
                         <Button
-                          key={t === null ? 'off' : t}
+                          key={t === null ? "off" : t}
+                          type="button"
                           variant={timer === t ? "default" : "ghost"}
                           size="sm"
                           onClick={() => setTimer(t)}
                           className="justify-start text-xs"
                         >
-                          {t === null ? "Off" : `${t < 60 ? t + 's' : (t/60) + 'm'}`}
+                          {t === null ? "Off" : t < 60 ? `${t}s` : `${t / 60}m`}
                         </Button>
                       ))}
                     </div>
                   </PopoverContent>
                 </Popover>
-                <Input 
+
+                <Input
                   className="flex-1 bg-background"
                   placeholder="Type secure message..."
                   value={messageInput}
-                  onChange={(e) => { setMessageInput(e.target.value); handleTyping(); }}
+                  onChange={(e) => {
+                    setMessageInput(e.target.value);
+                    handleTyping();
+                  }}
                 />
-                <Button type="submit" disabled={!messageInput.trim() || sendMessageMutation.isPending} size="icon">
+
+                <Button
+                  type="submit"
+                  size="icon"
+                  disabled={!messageInput.trim() || sendMessageMutation.isPending}
+                >
                   <Send className="w-4 h-4" />
                 </Button>
               </form>
             </div>
           </>
         ) : (
-          <div className="flex-1 flex flex-col items-center justify-center text-muted-foreground">
+          /* Empty state — desktop only */
+          <div className="flex-1 flex flex-col items-center justify-center text-muted-foreground select-none">
             <Shield className="w-16 h-16 mb-4 opacity-20" />
-            <p>Select a channel to begin secure transmission</p>
+            <p className="text-sm">Select a channel to begin secure transmission</p>
           </div>
         )}
       </div>
@@ -328,46 +365,195 @@ export default function ChatPage() {
   );
 }
 
-function MessageBubble({ msg, isMe }: { msg: Message, isMe: boolean }) {
+/* ── Sub-components ── */
+
+function SearchList({
+  results,
+  query,
+  onSelect,
+}: {
+  results: User[];
+  query: string;
+  onSelect: (id: string) => void;
+}) {
+  const filtered = results.filter(
+    (u) =>
+      u.username.toLowerCase().includes(query.toLowerCase()) ||
+      u.email.toLowerCase().includes(query.toLowerCase()),
+  );
+  return (
+    <div className="p-2">
+      <div className="text-xs text-muted-foreground mb-2 px-2 uppercase tracking-wider font-semibold">
+        Search Results
+      </div>
+      {filtered.length === 0 && (
+        <p className="text-xs text-muted-foreground px-3 py-4 text-center">No operatives found</p>
+      )}
+      {filtered.map((user) => (
+        <button
+          key={user.id}
+          onClick={() => onSelect(user.id)}
+          className="w-full flex items-center gap-3 p-3 hover:bg-muted rounded-lg transition-colors text-left"
+        >
+          <Avatar>
+            <AvatarImage src={user.profilePicture || ""} />
+            <AvatarFallback>{user.username.slice(0, 2).toUpperCase()}</AvatarFallback>
+          </Avatar>
+          <div className="flex-1 overflow-hidden">
+            <div className="font-medium truncate">{user.username}</div>
+            <div className="text-xs text-muted-foreground truncate">{user.email}</div>
+          </div>
+        </button>
+      ))}
+    </div>
+  );
+}
+
+function ConversationList({
+  conversations,
+  selectedUserId,
+  onlineUsers,
+  onSelect,
+}: {
+  conversations: Array<{
+    user: User;
+    lastMessage: Message | null;
+    unreadCount: number;
+  }>;
+  selectedUserId: string | null;
+  onlineUsers: Set<string>;
+  onSelect: (id: string) => void;
+}) {
+  if (conversations.length === 0) {
+    return (
+      <div className="flex flex-col items-center justify-center py-16 text-muted-foreground text-sm gap-2">
+        <Shield className="w-8 h-8 opacity-20" />
+        <p>No conversations yet</p>
+        <p className="text-xs">Search for an operative above</p>
+      </div>
+    );
+  }
+  return (
+    <div className="p-2">
+      {conversations.map((conv) => {
+        const isSelected = selectedUserId === conv.user.id;
+        const isOnline = onlineUsers.has(conv.user.id) || conv.user.isOnline;
+        return (
+          <button
+            key={conv.user.id}
+            onClick={() => onSelect(conv.user.id)}
+            className={`w-full flex items-center gap-3 p-3 rounded-lg transition-colors text-left mb-1 border ${
+              isSelected ? "bg-primary/10 border-primary/20" : "hover:bg-muted border-transparent"
+            }`}
+          >
+            <div className="relative shrink-0">
+              <Avatar>
+                <AvatarImage src={conv.user.profilePicture || ""} />
+                <AvatarFallback>{conv.user.username.slice(0, 2).toUpperCase()}</AvatarFallback>
+              </Avatar>
+              {isOnline && (
+                <div className="absolute bottom-0 right-0 w-3 h-3 bg-green-500 border-2 border-card rounded-full" />
+              )}
+            </div>
+            <div className="flex-1 overflow-hidden min-w-0">
+              <div className="flex justify-between items-center">
+                <span className="font-medium truncate">{conv.user.username}</span>
+                {conv.lastMessage && (
+                  <span className="text-xs text-muted-foreground shrink-0 ml-1">
+                    {format(new Date(conv.lastMessage.createdAt), "HH:mm")}
+                  </span>
+                )}
+              </div>
+              <div className="flex justify-between items-center mt-0.5">
+                <span className="text-sm text-muted-foreground truncate">
+                  {conv.lastMessage?.plainText || (conv.lastMessage ? "[Encrypted]" : "No messages")}
+                </span>
+                {conv.unreadCount > 0 && (
+                  <span className="ml-1 shrink-0 bg-primary text-primary-foreground text-xs font-bold px-1.5 py-0.5 rounded-full">
+                    {conv.unreadCount}
+                  </span>
+                )}
+              </div>
+            </div>
+          </button>
+        );
+      })}
+    </div>
+  );
+}
+
+function MessageBubble({
+  msg,
+  isMe,
+  onExpire,
+}: {
+  msg: Message;
+  isMe: boolean;
+  onExpire: (id: string) => void;
+}) {
   const [timeLeft, setTimeLeft] = useState<number | null>(null);
+  const expiredRef = useRef(false);
 
   useEffect(() => {
     if (!msg.expiresAt) return;
-    
-    const updateTimer = () => {
+
+    const tick = () => {
       const diff = differenceInSeconds(new Date(msg.expiresAt!), new Date());
       if (diff <= 0) {
         setTimeLeft(0);
+        if (!expiredRef.current) {
+          expiredRef.current = true;
+          onExpire(msg.id);
+        }
       } else {
         setTimeLeft(diff);
       }
     };
 
-    updateTimer();
-    const interval = setInterval(updateTimer, 1000);
+    tick();
+    const interval = setInterval(tick, 1000);
     return () => clearInterval(interval);
-  }, [msg.expiresAt]);
+  }, [msg.expiresAt, msg.id, onExpire]);
 
-  if (timeLeft === 0) return null; // Message expired
+  if (timeLeft === 0) return null;
+
+  const urgency =
+    timeLeft !== null && timeLeft <= 10
+      ? "border border-destructive/60"
+      : timeLeft !== null && timeLeft <= 30
+      ? "border border-yellow-500/40"
+      : "";
 
   return (
     <div className={`flex flex-col ${isMe ? "items-end" : "items-start"}`}>
-      <div className={`max-w-[70%] rounded-xl p-3 ${
-        isMe ? "bg-primary text-primary-foreground rounded-tr-sm" : "bg-secondary text-secondary-foreground rounded-tl-sm"
-      }`}>
-        <p className="text-sm leading-relaxed whitespace-pre-wrap">{msg.plainText || msg.encryptedMessage}</p>
-        
-        <div className={`flex items-center justify-end gap-2 mt-1 text-[10px] ${isMe ? "text-primary-foreground/70" : "text-muted-foreground"}`}>
-          {msg.timer && (
-            <span className="flex items-center gap-1 font-mono">
+      <div
+        className={`max-w-[80%] md:max-w-[70%] rounded-xl p-3 ${
+          isMe
+            ? "bg-primary text-primary-foreground rounded-tr-sm"
+            : "bg-secondary text-secondary-foreground rounded-tl-sm"
+        } ${urgency}`}
+      >
+        <p className="text-sm leading-relaxed whitespace-pre-wrap break-words">
+          {msg.plainText || msg.encryptedMessage}
+        </p>
+
+        <div
+          className={`flex items-center justify-end gap-2 mt-1 text-[10px] ${
+            isMe ? "text-primary-foreground/70" : "text-muted-foreground"
+          }`}
+        >
+          {msg.timer && timeLeft !== null && (
+            <span
+              className={`flex items-center gap-1 font-mono ${
+                timeLeft <= 10 ? "text-red-400 font-bold" : ""
+              }`}
+            >
               <Clock className="w-3 h-3" />
-              {timeLeft !== null ? timeLeft : msg.timer}s
+              {timeLeft}s
             </span>
           )}
           <span>{format(new Date(msg.createdAt), "HH:mm")}</span>
-          {isMe && (
-            msg.isRead ? <CheckCheck className="w-3 h-3" /> : <Check className="w-3 h-3" />
-          )}
+          {isMe && (msg.isRead ? <CheckCheck className="w-3 h-3" /> : <Check className="w-3 h-3" />)}
         </div>
       </div>
     </div>

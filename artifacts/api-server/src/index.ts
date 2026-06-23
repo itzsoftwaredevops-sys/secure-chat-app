@@ -4,8 +4,8 @@ import jwt from "jsonwebtoken";
 import app from "./app.js";
 import { logger } from "./lib/logger.js";
 import { db } from "./lib/db.js";
-import { usersTable } from "@workspace/db";
-import { eq } from "drizzle-orm";
+import { usersTable, messagesTable } from "@workspace/db";
+import { eq, lte, and, isNotNull } from "drizzle-orm";
 
 const rawPort = process.env["PORT"];
 if (!rawPort) throw new Error("PORT environment variable is required but was not provided.");
@@ -69,3 +69,27 @@ io.on("connection", async (socket) => {
 httpServer.listen(port, () => {
   logger.info({ port }, "Server listening");
 });
+
+// ── Background sweeper: hard-delete expired self-destructing messages ──
+async function sweepExpiredMessages() {
+  try {
+    const expired = await db
+      .delete(messagesTable)
+      .where(and(isNotNull(messagesTable.expiresAt), lte(messagesTable.expiresAt, new Date())))
+      .returning({ id: messagesTable.id, senderId: messagesTable.senderId, receiverId: messagesTable.receiverId });
+
+    for (const msg of expired) {
+      io.to(msg.senderId).emit("messageExpired", { id: msg.id });
+      io.to(msg.receiverId).emit("messageExpired", { id: msg.id });
+    }
+
+    if (expired.length > 0) {
+      logger.info({ count: expired.length }, "Swept expired messages");
+    }
+  } catch (err) {
+    logger.error({ err }, "Sweeper error");
+  }
+}
+
+// Run every 15 seconds
+setInterval(sweepExpiredMessages, 15_000);
