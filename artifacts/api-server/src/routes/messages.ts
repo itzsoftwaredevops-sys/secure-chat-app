@@ -26,6 +26,7 @@ export function formatMessage(msg: Message) {
     plainText: decryptMessage(msg.encryptedMessage) || null,
     timer: msg.timer ?? null,
     expiresAt: msg.expiresAt ? msg.expiresAt.toISOString() : null,
+    isDelivered: msg.isDelivered,
     isRead: msg.isRead,
     createdAt: msg.createdAt.toISOString(),
   };
@@ -135,12 +136,28 @@ router.post("/messages", authMiddleware, async (req: AuthRequest, res) => {
       .values({ senderId: req.userId!, receiverId, encryptedMessage: encrypted, timer: timer ?? null, expiresAt })
       .returning();
 
-    const formatted = formatMessage(msg);
+    let formatted = formatMessage(msg);
 
     const io = (req as any).io;
     if (io) {
+      // If the receiver has an active socket, mark as delivered immediately
+      const receiverRoom = io.sockets.adapter.rooms.get(receiverId);
+      if (receiverRoom && receiverRoom.size > 0) {
+        const [updated] = await db
+          .update(messagesTable)
+          .set({ isDelivered: true })
+          .where(eq(messagesTable.id, msg.id))
+          .returning();
+        if (updated) formatted = formatMessage(updated);
+      }
+
       io.to(receiverId).emit("newMessage", formatted);
       io.to(req.userId!).emit("newMessage", formatted);
+
+      // Tell sender about delivery if it happened right away
+      if (formatted.isDelivered) {
+        io.to(req.userId!).emit("messageDelivered", { id: formatted.id });
+      }
     }
 
     res.status(201).json(formatted);

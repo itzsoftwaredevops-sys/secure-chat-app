@@ -75,6 +75,8 @@ export default function ChatPage() {
   const [onlineUsers, setOnlineUsers] = useState<Set<string>>(new Set());
   const [typingUsers, setTypingUsers] = useState<Set<string>>(new Set());
   const [expiredIds, setExpiredIds] = useState<Set<string>>(new Set());
+  // Local overlay for delivered IDs — avoids refetch latency for tick upgrades
+  const [deliveredIds, setDeliveredIds] = useState<Set<string>>(new Set());
 
   const { notify } = useNotifications();
 
@@ -185,6 +187,9 @@ export default function ChatPage() {
           tag: msg.senderId, // collapses multiple messages from same sender
         });
       }
+    });
+    socket.on("messageDelivered", ({ id }: { id: string }) => {
+      setDeliveredIds((prev) => new Set(prev).add(id));
     });
     socket.on("messageExpired", ({ id }: { id: string }) => {
       setExpiredIds((prev) => new Set(prev).add(id));
@@ -377,6 +382,7 @@ export default function ChatPage() {
                     key={msg.id}
                     msg={msg}
                     isMe={msg.senderId === me?.id}
+                    isDeliveredOverride={deliveredIds.has(msg.id)}
                     onExpire={handleExpireMessage}
                   />
                 ))}
@@ -642,10 +648,12 @@ function ConversationList({
 function MessageBubble({
   msg,
   isMe,
+  isDeliveredOverride,
   onExpire,
 }: {
   msg: Message;
   isMe: boolean;
+  isDeliveredOverride: boolean;
   onExpire: (id: string) => void;
 }) {
   const [timeLeft, setTimeLeft] = useState<number | null>(null);
@@ -698,7 +706,18 @@ function MessageBubble({
             </span>
           )}
           <span>{format(new Date(msg.createdAt), "HH:mm")}</span>
-          {isMe && (msg.isRead ? <CheckCheck className="w-3 h-3" /> : <Check className="w-3 h-3" />)}
+          {isMe && (() => {
+            if (msg.isRead) {
+              // ✓✓ teal — read
+              return <CheckCheck className="w-3 h-3 text-primary" />;
+            }
+            if (msg.isDelivered || isDeliveredOverride) {
+              // ✓✓ muted — delivered but not yet read
+              return <CheckCheck className="w-3 h-3 opacity-70" />;
+            }
+            // ✓ single — sent, not yet delivered
+            return <Check className="w-3 h-3 opacity-70" />;
+          })()}
         </div>
       </div>
     </div>

@@ -137,6 +137,7 @@ export const GetConversationsResponseItem = zod.object({
   "plainText": zod.string().nullish(),
   "timer": zod.number().nullish(),
   "expiresAt": zod.string().nullish(),
+  "isDelivered": zod.boolean().optional(),
   "isRead": zod.boolean().optional(),
   "createdAt": zod.string()
 }),
@@ -160,6 +161,7 @@ export const GetMessagesResponseItem = zod.object({
   "plainText": zod.string().nullish(),
   "timer": zod.number().nullish(),
   "expiresAt": zod.string().nullish(),
+  "isDelivered": zod.boolean().optional(),
   "isRead": zod.boolean().optional(),
   "createdAt": zod.string()
 })
@@ -182,6 +184,7 @@ export const SearchMessagesResponseItem = zod.object({
   "plainText": zod.string().nullish(),
   "timer": zod.number().nullish(),
   "expiresAt": zod.string().nullish(),
+  "isDelivered": zod.boolean().optional(),
   "isRead": zod.boolean().optional(),
   "createdAt": zod.string()
 }),
@@ -225,6 +228,7 @@ export const MarkMessageReadResponse = zod.object({
   "plainText": zod.string().nullish(),
   "timer": zod.number().nullish(),
   "expiresAt": zod.string().nullish(),
+  "isDelivered": zod.boolean().optional(),
   "isRead": zod.boolean().optional(),
   "createdAt": zod.string()
 })

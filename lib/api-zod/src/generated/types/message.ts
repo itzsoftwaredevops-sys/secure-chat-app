@@ -17,6 +17,7 @@ export interface Message {
   timer?: number | null;
   /** @nullable */
   expiresAt?: string | null;
+  isDelivered?: boolean;
   isRead?: boolean;
   createdAt: string;
 }

@@ -5,7 +5,7 @@ import app from "./app.js";
 import { logger } from "./lib/logger.js";
 import { db } from "./lib/db.js";
 import { usersTable, messagesTable } from "@workspace/db";
-import { eq, lte, and, isNotNull } from "drizzle-orm";
+import { eq, lte, and, isNotNull, ne } from "drizzle-orm";
 
 const rawPort = process.env["PORT"];
 if (!rawPort) throw new Error("PORT environment variable is required but was not provided.");
@@ -43,8 +43,26 @@ io.on("connection", async (socket) => {
   try {
     await db.update(usersTable).set({ isOnline: true }).where(eq(usersTable.id, userId));
     io.emit("userOnline", { userId });
+
+    // Mark all undelivered messages sent TO this user as delivered,
+    // then notify each sender so they can upgrade their tick.
+    const undelivered = await db
+      .update(messagesTable)
+      .set({ isDelivered: true })
+      .where(
+        and(
+          eq(messagesTable.receiverId, userId),
+          eq(messagesTable.isDelivered, false),
+        ),
+      )
+      .returning({ id: messagesTable.id, senderId: messagesTable.senderId });
+
+    for (const msg of undelivered) {
+      // Tell the original sender their message was delivered
+      io.to(msg.senderId).emit("messageDelivered", { id: msg.id });
+    }
   } catch (err) {
-    logger.error({ err }, "Error setting user online");
+    logger.error({ err }, "Error on socket connect");
   }
 
   socket.on("typing", ({ receiverId }: { receiverId: string }) => {
@@ -91,5 +109,4 @@ async function sweepExpiredMessages() {
   }
 }
 
-// Run every 15 seconds
 setInterval(sweepExpiredMessages, 15_000);

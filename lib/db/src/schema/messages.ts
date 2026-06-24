@@ -10,12 +10,14 @@ export const messagesTable = pgTable("messages", {
   encryptedMessage: text("encrypted_message").notNull(),
   timer: integer("timer"),
   expiresAt: timestamp("expires_at"),
+  isDelivered: boolean("is_delivered").notNull().default(false),
   isRead: boolean("is_read").notNull().default(false),
   createdAt: timestamp("created_at").notNull().defaultNow(),
 });
 
 export const insertMessageSchema = createInsertSchema(messagesTable).omit({
   id: true,
+  isDelivered: true,
   isRead: true,
   createdAt: true,
 });

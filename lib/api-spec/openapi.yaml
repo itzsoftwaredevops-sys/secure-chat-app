@@ -424,6 +424,8 @@ components:
           type: ["integer", "null"]
         expiresAt:
           type: ["string", "null"]
+        isDelivered:
+          type: boolean
         isRead:
           type: boolean
         createdAt:
