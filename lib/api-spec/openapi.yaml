@@ -18,6 +18,8 @@ tags:
     description: Message operations
   - name: conversations
     description: Conversation operations
+  - name: Storage
+    description: Object storage upload and serving endpoints.
 paths:
   /healthz:
     get:
