@@ -23,6 +23,7 @@ import {
 } from "lucide-react";
 import { io, Socket } from "socket.io-client";
 import type { Message, User, SearchResult } from "@workspace/api-client-react";
+import { useNotifications } from "@/hooks/use-notifications";
 
 /* ─────────────────────────────────────────────── */
 /*  Helpers                                         */
@@ -75,6 +76,13 @@ export default function ChatPage() {
   const [typingUsers, setTypingUsers] = useState<Set<string>>(new Set());
   const [expiredIds, setExpiredIds] = useState<Set<string>>(new Set());
 
+  const { notify } = useNotifications();
+
+  // Refs so socket callbacks always see fresh values without re-subscribing
+  const conversationsRef = useRef<typeof conversations>([]);
+  const meRef = useRef(me);
+  useEffect(() => { meRef.current = me; }, [me]);
+
   // Keep ref in sync for socket callbacks
   useEffect(() => { selectedUserIdRef.current = selectedUserId; }, [selectedUserId]);
 
@@ -108,6 +116,8 @@ export default function ChatPage() {
   const deleteMessageMutation = useDeleteMessage();
 
   /* ── Side effects ── */
+  useEffect(() => { conversationsRef.current = conversations; }, [conversations]);
+
   useEffect(() => {
     if (onlineUsersData?.onlineUserIds) {
       setOnlineUsers(new Set(onlineUsersData.onlineUserIds));
@@ -153,10 +163,28 @@ export default function ChatPage() {
     });
     socket.on("newMessage", (msg: Message) => {
       const active = selectedUserIdRef.current;
+      const myId = meRef.current?.id;
+
+      // Refresh data
       if (active && (msg.senderId === active || msg.receiverId === active)) {
         refetchMessages();
       }
       refetchConversations();
+
+      // Push notification — only for incoming messages (not our own)
+      if (msg.senderId !== myId) {
+        const conv = conversationsRef.current.find(
+          (c) => c.user.id === msg.senderId,
+        );
+        const senderName = conv?.user.username ?? "New message";
+        const body = msg.plainText
+          ? msg.plainText.slice(0, 100)
+          : "🔒 Encrypted message";
+        notify(`SecureChat — ${senderName}`, {
+          body,
+          tag: msg.senderId, // collapses multiple messages from same sender
+        });
+      }
     });
     socket.on("messageExpired", ({ id }: { id: string }) => {
       setExpiredIds((prev) => new Set(prev).add(id));
