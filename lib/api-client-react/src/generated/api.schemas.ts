@@ -88,10 +88,25 @@ export interface Conversation {
   unreadCount: number;
 }
 
+export interface SearchResult {
+  message: Message;
+  otherUser: User;
+  conversationUserId: string;
+  /** Surrounding context with the matched term highlighted using **markers** */
+  snippet: string;
+}
+
 export type GetUsersParams = {
 /**
  * Search by username or email
  */
 search?: string;
+};
+
+export type SearchMessagesParams = {
+/**
+ * Keyword to search for in decrypted message content
+ */
+q: string;
 };
 

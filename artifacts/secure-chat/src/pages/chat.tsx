@@ -8,6 +8,7 @@ import {
   useMarkMessageRead,
   useDeleteMessage,
   useGetOnlineUsers,
+  useSearchMessages,
 } from "@workspace/api-client-react";
 import { Link } from "wouter";
 import { format, differenceInSeconds } from "date-fns";
@@ -18,61 +19,101 @@ import { Avatar, AvatarFallback, AvatarImage } from "@/components/ui/avatar";
 import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
 import {
   Shield, Clock, Send, Search, Check, CheckCheck,
-  User as UserIcon, ArrowLeft, Menu,
+  User as UserIcon, ArrowLeft, X, SearchCode,
 } from "lucide-react";
 import { io, Socket } from "socket.io-client";
-import { useQueryClient } from "@tanstack/react-query";
-import type { Message, User } from "@workspace/api-client-react";
+import type { Message, User, SearchResult } from "@workspace/api-client-react";
+
+/* ─────────────────────────────────────────────── */
+/*  Helpers                                         */
+/* ─────────────────────────────────────────────── */
+
+/** Render a snippet string with **bold** markers into JSX spans */
+function SnippetText({ snippet }: { snippet: string }) {
+  const parts = snippet.split(/(\*\*[^*]+\*\*)/g);
+  return (
+    <span>
+      {parts.map((part, i) =>
+        part.startsWith("**") && part.endsWith("**") ? (
+          <mark key={i} className="bg-primary/30 text-foreground rounded px-0.5">
+            {part.slice(2, -2)}
+          </mark>
+        ) : (
+          <span key={i}>{part}</span>
+        ),
+      )}
+    </span>
+  );
+}
+
+/* ─────────────────────────────────────────────── */
+/*  Main page                                       */
+/* ─────────────────────────────────────────────── */
+
+type SidebarMode = "chats" | "search-users" | "search-messages";
 
 export default function ChatPage() {
   const { data: me } = useGetMe();
-  const queryClient = useQueryClient();
 
   const [selectedUserId, setSelectedUserId] = useState<string | null>(null);
   const selectedUserIdRef = useRef<string | null>(null);
-  const [searchQuery, setSearchQuery] = useState("");
   const [messageInput, setMessageInput] = useState("");
   const [timer, setTimer] = useState<number | null>(null);
   const [showSidebar, setShowSidebar] = useState(true);
-  const scrollRef = useRef<HTMLDivElement>(null);
 
-  // Sockets — stable connection, never reconnects
+  // Sidebar mode & search state
+  const [sidebarMode, setSidebarMode] = useState<SidebarMode>("chats");
+  const [userQuery, setUserQuery] = useState("");
+  const [msgQuery, setMsgQuery] = useState("");
+  const [debouncedMsgQuery, setDebouncedMsgQuery] = useState("");
+
+  const scrollRef = useRef<HTMLDivElement>(null);
   const socketRef = useRef<Socket | null>(null);
   const typingTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+
   const [onlineUsers, setOnlineUsers] = useState<Set<string>>(new Set());
   const [typingUsers, setTypingUsers] = useState<Set<string>>(new Set());
   const [expiredIds, setExpiredIds] = useState<Set<string>>(new Set());
 
-  // Keep ref in sync so socket callbacks can read current value without re-subscribing
-  useEffect(() => {
-    selectedUserIdRef.current = selectedUserId;
-  }, [selectedUserId]);
+  // Keep ref in sync for socket callbacks
+  useEffect(() => { selectedUserIdRef.current = selectedUserId; }, [selectedUserId]);
 
-  // Queries — sockets handle real-time; polling kept short as a fallback
+  // Debounce message search query
+  useEffect(() => {
+    const t = setTimeout(() => setDebouncedMsgQuery(msgQuery), 400);
+    return () => clearTimeout(t);
+  }, [msgQuery]);
+
+  /* ── Queries ── */
   const { data: onlineUsersData } = useGetOnlineUsers(
     { query: { refetchInterval: 15000 } as any },
   );
-
   const { data: conversations = [], refetch: refetchConversations } = useGetConversations(
     { query: { refetchInterval: 8000 } as any },
   );
-
   const { data: messages = [], refetch: refetchMessages } = useGetMessages(selectedUserId!, {
     query: { enabled: !!selectedUserId } as any,
   });
+  const { data: userSearchResults = [] } = useGetUsers(
+    { search: userQuery },
+    { query: { enabled: userQuery.length > 1 } as any },
+  );
+  const { data: msgSearchResults = [], isFetching: searchFetching } = useSearchMessages(
+    { q: debouncedMsgQuery },
+    { query: { enabled: debouncedMsgQuery.length > 1 } as any },
+  );
 
   const sendMessageMutation = useSendMessage();
   const markReadMutation = useMarkMessageRead();
   const deleteMessageMutation = useDeleteMessage();
 
-  // Seed online users from REST poll
+  /* ── Side effects ── */
   useEffect(() => {
     if (onlineUsersData?.onlineUserIds) {
       setOnlineUsers(new Set(onlineUsersData.onlineUserIds));
     }
   }, [onlineUsersData]);
 
-  // Mark incoming messages as read when conversation opens
   useEffect(() => {
     if (!messages.length || !selectedUserId) return;
     messages
@@ -80,14 +121,13 @@ export default function ChatPage() {
       .forEach((m) => markReadMutation.mutate({ id: m.id }));
   }, [messages, selectedUserId]);
 
-  // Auto-scroll to bottom
   useEffect(() => {
     if (scrollRef.current) {
       scrollRef.current.scrollTop = scrollRef.current.scrollHeight;
     }
   }, [messages, expiredIds]);
 
-  // Socket — connect ONCE on mount, never reconnect
+  /* ── Socket (connect once on mount) ── */
   useEffect(() => {
     const token = localStorage.getItem("chat_token");
     if (!token) return;
@@ -102,41 +142,31 @@ export default function ChatPage() {
     socket.on("userOnline", ({ userId }: { userId: string }) => {
       setOnlineUsers((prev) => new Set(prev).add(userId));
     });
-
     socket.on("userOffline", ({ userId }: { userId: string }) => {
       setOnlineUsers((prev) => { const n = new Set(prev); n.delete(userId); return n; });
     });
-
     socket.on("typing", ({ userId }: { userId: string }) => {
       setTypingUsers((prev) => new Set(prev).add(userId));
       setTimeout(() => {
         setTypingUsers((prev) => { const n = new Set(prev); n.delete(userId); return n; });
       }, 3000);
     });
-
-    // New message — refresh only the active conversation
     socket.on("newMessage", (msg: Message) => {
       const active = selectedUserIdRef.current;
-      const isRelevant =
-        active && (msg.senderId === active || msg.receiverId === active);
-      if (isRelevant) {
+      if (active && (msg.senderId === active || msg.receiverId === active)) {
         refetchMessages();
       }
       refetchConversations();
     });
-
-    // Server confirmed a message was deleted (expired or manual)
     socket.on("messageExpired", ({ id }: { id: string }) => {
       setExpiredIds((prev) => new Set(prev).add(id));
       refetchConversations();
     });
 
-    return () => {
-      socket.disconnect();
-      socketRef.current = null;
-    };
+    return () => { socket.disconnect(); socketRef.current = null; };
   }, []); // eslint-disable-line react-hooks/exhaustive-deps
 
+  /* ── Handlers ── */
   const handleSendMessage = (e: React.FormEvent) => {
     e.preventDefault();
     if (!messageInput.trim() || !selectedUserId) return;
@@ -151,7 +181,6 @@ export default function ChatPage() {
   const handleTyping = useCallback(() => {
     if (!socketRef.current || !selectedUserId) return;
     socketRef.current.emit("typing", { receiverId: selectedUserId });
-
     if (typingTimeoutRef.current) clearTimeout(typingTimeoutRef.current);
     typingTimeoutRef.current = setTimeout(() => {
       socketRef.current?.emit("stopTyping", { receiverId: selectedUserId });
@@ -160,8 +189,10 @@ export default function ChatPage() {
 
   const handleSelectUser = (userId: string) => {
     setSelectedUserId(userId);
-    setSearchQuery("");
-    setShowSidebar(false); // on mobile, hide sidebar when chat opens
+    setUserQuery("");
+    setMsgQuery("");
+    setSidebarMode("chats");
+    setShowSidebar(false);
   };
 
   const handleExpireMessage = useCallback(
@@ -175,48 +206,97 @@ export default function ChatPage() {
   const selectedUser = conversations.find((c) => c.user.id === selectedUserId)?.user;
   const visibleMessages = messages.filter((m) => !expiredIds.has(m.id));
 
+  /* ── Render ── */
   return (
     <div className="flex h-screen w-full bg-background text-foreground overflow-hidden">
-      {/* ── Sidebar ── */}
-      <div
-        className={`
-          flex flex-col bg-card border-r border-border
-          w-full md:w-80 md:flex flex-shrink-0
-          ${showSidebar ? "flex" : "hidden"}
-          md:flex
-        `}
-      >
+
+      {/* ══ SIDEBAR ══ */}
+      <div className={`
+        flex flex-col bg-card border-r border-border w-full md:w-80 md:flex flex-shrink-0
+        ${showSidebar ? "flex" : "hidden"} md:flex
+      `}>
         {/* Header */}
         <div className="p-4 border-b border-border flex items-center justify-between shrink-0">
           <div className="flex items-center gap-2 text-primary font-bold">
             <Shield className="w-5 h-5" />
             <span>SecureChat</span>
           </div>
-          <Link href="/profile" className="p-2 hover:bg-muted rounded-full transition-colors">
-            <UserIcon className="w-5 h-5 text-muted-foreground" />
-          </Link>
-        </div>
-
-        {/* Search */}
-        <div className="p-4 shrink-0">
-          <div className="relative">
-            <Search className="w-4 h-4 absolute left-3 top-1/2 -translate-y-1/2 text-muted-foreground" />
-            <Input
-              placeholder="Search operatives..."
-              className="pl-9 bg-background border-border"
-              value={searchQuery}
-              onChange={(e) => setSearchQuery(e.target.value)}
-            />
+          <div className="flex items-center gap-1">
+            <button
+              title="Search messages"
+              onClick={() => setSidebarMode(sidebarMode === "search-messages" ? "chats" : "search-messages")}
+              className={`p-2 rounded-full transition-colors ${sidebarMode === "search-messages" ? "bg-primary/20 text-primary" : "hover:bg-muted text-muted-foreground"}`}
+            >
+              <SearchCode className="w-4 h-4" />
+            </button>
+            <Link href="/profile" className="p-2 hover:bg-muted rounded-full transition-colors">
+              <UserIcon className="w-5 h-5 text-muted-foreground" />
+            </Link>
           </div>
         </div>
 
-        {/* Conversation / Search list */}
+        {/* Search bar */}
+        <div className="p-3 shrink-0">
+          {sidebarMode === "search-messages" ? (
+            <div className="relative">
+              <Search className="w-4 h-4 absolute left-3 top-1/2 -translate-y-1/2 text-muted-foreground" />
+              <Input
+                autoFocus
+                placeholder="Search message history..."
+                className="pl-9 pr-8 bg-background border-border"
+                value={msgQuery}
+                onChange={(e) => setMsgQuery(e.target.value)}
+              />
+              {msgQuery && (
+                <button
+                  onClick={() => setMsgQuery("")}
+                  className="absolute right-2 top-1/2 -translate-y-1/2 text-muted-foreground hover:text-foreground"
+                >
+                  <X className="w-4 h-4" />
+                </button>
+              )}
+            </div>
+          ) : (
+            <div className="relative">
+              <Search className="w-4 h-4 absolute left-3 top-1/2 -translate-y-1/2 text-muted-foreground" />
+              <Input
+                placeholder="Find operatives..."
+                className="pl-9 bg-background border-border"
+                value={userQuery}
+                onChange={(e) => {
+                  setUserQuery(e.target.value);
+                  setSidebarMode(e.target.value.length > 0 ? "search-users" : "chats");
+                }}
+              />
+              {userQuery && (
+                <button
+                  onClick={() => { setUserQuery(""); setSidebarMode("chats"); }}
+                  className="absolute right-2 top-1/2 -translate-y-1/2 text-muted-foreground hover:text-foreground"
+                >
+                  <X className="w-4 h-4" />
+                </button>
+              )}
+            </div>
+          )}
+        </div>
+
+        {/* List area */}
         <ScrollArea className="flex-1">
-          {searchQuery.length > 1 ? (
-            <SearchList results={conversations.map((c) => c.user)} query={searchQuery} onSelect={handleSelectUser} />
+          {sidebarMode === "search-messages" ? (
+            <MessageSearchResults
+              query={debouncedMsgQuery}
+              results={msgSearchResults as SearchResult[]}
+              isFetching={searchFetching}
+              onSelect={handleSelectUser}
+            />
+          ) : sidebarMode === "search-users" ? (
+            <UserSearchList
+              results={userSearchResults as User[]}
+              onSelect={handleSelectUser}
+            />
           ) : (
             <ConversationList
-              conversations={conversations}
+              conversations={conversations as any}
               selectedUserId={selectedUserId}
               onlineUsers={onlineUsers}
               onSelect={handleSelectUser}
@@ -225,17 +305,14 @@ export default function ChatPage() {
         </ScrollArea>
       </div>
 
-      {/* ── Main chat area ── */}
-      <div
-        className={`
-          flex-1 flex flex-col bg-background relative
-          ${!showSidebar ? "flex" : "hidden"}
-          md:flex
-        `}
-      >
+      {/* ══ CHAT AREA ══ */}
+      <div className={`
+        flex-1 flex flex-col bg-background relative
+        ${!showSidebar ? "flex" : "hidden"} md:flex
+      `}>
         {selectedUserId ? (
           <>
-            {/* Header */}
+            {/* Chat header */}
             <div className="h-16 border-b border-border flex items-center px-4 bg-card shrink-0 gap-3">
               <button
                 className="md:hidden p-2 hover:bg-muted rounded-full transition-colors"
@@ -254,15 +331,11 @@ export default function ChatPage() {
                   )}
                 </div>
                 <div className="min-w-0">
-                  <div className="font-semibold truncate">
-                    {selectedUser?.username ?? "Operative"}
-                  </div>
+                  <div className="font-semibold truncate">{selectedUser?.username ?? "Operative"}</div>
                   <div className="text-xs text-muted-foreground">
-                    {selectedUser && onlineUsers.has(selectedUser.id) ? (
-                      <span className="text-green-400">Online</span>
-                    ) : (
-                      "Offline"
-                    )}
+                    {selectedUser && onlineUsers.has(selectedUser.id)
+                      ? <span className="text-green-400">Online</span>
+                      : "Offline"}
                   </div>
                 </div>
               </div>
@@ -280,8 +353,6 @@ export default function ChatPage() {
                   />
                 ))}
               </div>
-
-              {/* Typing indicator */}
               {typingUsers.has(selectedUserId) && (
                 <div className="mt-4 text-sm text-muted-foreground italic flex items-center gap-2">
                   <div className="flex gap-1">
@@ -332,17 +403,12 @@ export default function ChatPage() {
                     </div>
                   </PopoverContent>
                 </Popover>
-
                 <Input
                   className="flex-1 bg-background"
                   placeholder="Type secure message..."
                   value={messageInput}
-                  onChange={(e) => {
-                    setMessageInput(e.target.value);
-                    handleTyping();
-                  }}
+                  onChange={(e) => { setMessageInput(e.target.value); handleTyping(); }}
                 />
-
                 <Button
                   type="submit"
                   size="icon"
@@ -354,7 +420,6 @@ export default function ChatPage() {
             </div>
           </>
         ) : (
-          /* Empty state — desktop only */
           <div className="flex-1 flex flex-col items-center justify-center text-muted-foreground select-none">
             <Shield className="w-16 h-16 mb-4 opacity-20" />
             <p className="text-sm">Select a channel to begin secure transmission</p>
@@ -365,31 +430,99 @@ export default function ChatPage() {
   );
 }
 
-/* ── Sub-components ── */
+/* ─────────────────────────────────────────────── */
+/*  Sub-components                                  */
+/* ─────────────────────────────────────────────── */
 
-function SearchList({
-  results,
+function MessageSearchResults({
   query,
+  results,
+  isFetching,
+  onSelect,
+}: {
+  query: string;
+  results: SearchResult[];
+  isFetching: boolean;
+  onSelect: (id: string) => void;
+}) {
+  if (!query || query.length < 2) {
+    return (
+      <div className="flex flex-col items-center justify-center py-12 text-muted-foreground text-sm gap-2">
+        <SearchCode className="w-8 h-8 opacity-20" />
+        <p>Type to search your messages</p>
+      </div>
+    );
+  }
+  if (isFetching) {
+    return (
+      <div className="flex items-center justify-center py-12">
+        <div className="w-5 h-5 border-2 border-primary border-t-transparent rounded-full animate-spin" />
+      </div>
+    );
+  }
+  if (results.length === 0) {
+    return (
+      <div className="flex flex-col items-center justify-center py-12 text-muted-foreground text-sm gap-1">
+        <Search className="w-6 h-6 opacity-20" />
+        <p>No messages found for "{query}"</p>
+      </div>
+    );
+  }
+  return (
+    <div className="p-2 space-y-1">
+      <div className="text-xs text-muted-foreground mb-2 px-2 uppercase tracking-wider font-semibold">
+        {results.length} result{results.length !== 1 ? "s" : ""}
+      </div>
+      {results.map((r) => (
+        <button
+          key={r.message.id}
+          onClick={() => onSelect(r.conversationUserId)}
+          className="w-full flex items-start gap-3 p-3 hover:bg-muted rounded-lg transition-colors text-left"
+        >
+          <Avatar className="w-8 h-8 shrink-0 mt-0.5">
+            <AvatarImage src={r.otherUser.profilePicture || ""} />
+            <AvatarFallback className="text-xs">
+              {r.otherUser.username.slice(0, 2).toUpperCase()}
+            </AvatarFallback>
+          </Avatar>
+          <div className="flex-1 min-w-0">
+            <div className="flex items-center justify-between mb-0.5">
+              <span className="text-sm font-medium truncate">{r.otherUser.username}</span>
+              <span className="text-xs text-muted-foreground shrink-0 ml-1">
+                {format(new Date(r.message.createdAt), "MMM d")}
+              </span>
+            </div>
+            <p className="text-xs text-muted-foreground leading-relaxed line-clamp-2">
+              <SnippetText snippet={r.snippet} />
+            </p>
+          </div>
+        </button>
+      ))}
+    </div>
+  );
+}
+
+function UserSearchList({
+  results,
   onSelect,
 }: {
   results: User[];
-  query: string;
   onSelect: (id: string) => void;
 }) {
-  const filtered = results.filter(
-    (u) =>
-      u.username.toLowerCase().includes(query.toLowerCase()) ||
-      u.email.toLowerCase().includes(query.toLowerCase()),
-  );
+  if (results.length === 0) {
+    return (
+      <div className="flex flex-col items-center justify-center py-12 text-muted-foreground text-sm gap-1">
+        <Search className="w-6 h-6 opacity-20" />
+        <p>No operatives found</p>
+      </div>
+    );
+  }
   return (
     <div className="p-2">
       <div className="text-xs text-muted-foreground mb-2 px-2 uppercase tracking-wider font-semibold">
-        Search Results
+        Operatives
       </div>
-      {filtered.length === 0 && (
-        <p className="text-xs text-muted-foreground px-3 py-4 text-center">No operatives found</p>
-      )}
-      {filtered.map((user) => (
+      {results.map((user) => (
         <button
           key={user.id}
           onClick={() => onSelect(user.id)}
@@ -415,11 +548,7 @@ function ConversationList({
   onlineUsers,
   onSelect,
 }: {
-  conversations: Array<{
-    user: User;
-    lastMessage: Message | null;
-    unreadCount: number;
-  }>;
+  conversations: Array<{ user: User; lastMessage: Message | null; unreadCount: number }>;
   selectedUserId: string | null;
   onlineUsers: Set<string>;
   onSelect: (id: string) => void;
@@ -496,28 +625,23 @@ function MessageBubble({
 
   useEffect(() => {
     if (!msg.expiresAt) return;
-
     const tick = () => {
       const diff = differenceInSeconds(new Date(msg.expiresAt!), new Date());
       if (diff <= 0) {
         setTimeLeft(0);
-        if (!expiredRef.current) {
-          expiredRef.current = true;
-          onExpire(msg.id);
-        }
+        if (!expiredRef.current) { expiredRef.current = true; onExpire(msg.id); }
       } else {
         setTimeLeft(diff);
       }
     };
-
     tick();
-    const interval = setInterval(tick, 1000);
-    return () => clearInterval(interval);
+    const id = setInterval(tick, 1000);
+    return () => clearInterval(id);
   }, [msg.expiresAt, msg.id, onExpire]);
 
   if (timeLeft === 0) return null;
 
-  const urgency =
+  const urgencyClass =
     timeLeft !== null && timeLeft <= 10
       ? "border border-destructive/60"
       : timeLeft !== null && timeLeft <= 30
@@ -531,23 +655,16 @@ function MessageBubble({
           isMe
             ? "bg-primary text-primary-foreground rounded-tr-sm"
             : "bg-secondary text-secondary-foreground rounded-tl-sm"
-        } ${urgency}`}
+        } ${urgencyClass}`}
       >
         <p className="text-sm leading-relaxed whitespace-pre-wrap break-words">
           {msg.plainText || msg.encryptedMessage}
         </p>
-
-        <div
-          className={`flex items-center justify-end gap-2 mt-1 text-[10px] ${
-            isMe ? "text-primary-foreground/70" : "text-muted-foreground"
-          }`}
-        >
+        <div className={`flex items-center justify-end gap-2 mt-1 text-[10px] ${
+          isMe ? "text-primary-foreground/70" : "text-muted-foreground"
+        }`}>
           {msg.timer && timeLeft !== null && (
-            <span
-              className={`flex items-center gap-1 font-mono ${
-                timeLeft <= 10 ? "text-red-400 font-bold" : ""
-              }`}
-            >
+            <span className={`flex items-center gap-1 font-mono ${timeLeft <= 10 ? "text-red-400 font-bold" : ""}`}>
               <Clock className="w-3 h-3" />
               {timeLeft}s
             </span>

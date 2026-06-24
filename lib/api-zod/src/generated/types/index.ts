@@ -16,5 +16,7 @@ export * from './message';
 export * from './messageInput';
 export * from './onlineUsers';
 export * from './registerInput';
+export * from './searchMessagesParams';
+export * from './searchResult';
 export * from './successResponse';
 export * from './user';

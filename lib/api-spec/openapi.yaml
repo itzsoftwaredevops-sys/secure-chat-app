@@ -451,3 +451,17 @@ components:
           $ref: "#/components/schemas/Message"
         unreadCount:
           type: integer
+
+    SearchResult:
+      type: object
+      required: [message, otherUser, conversationUserId, snippet]
+      properties:
+        message:
+          $ref: "#/components/schemas/Message"
+        otherUser:
+          $ref: "#/components/schemas/User"
+        conversationUserId:
+          type: string
+        snippet:
+          type: string
+          description: Surrounding context with the matched term highlighted using **markers**

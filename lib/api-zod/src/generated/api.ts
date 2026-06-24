@@ -167,6 +167,40 @@ export const GetMessagesResponse = zod.array(GetMessagesResponseItem)
 
 
 /**
+ * @summary Search through the current user's message history
+ */
+export const SearchMessagesQueryParams = zod.object({
+  "q": zod.coerce.string().describe('Keyword to search for in decrypted message content')
+})
+
+export const SearchMessagesResponseItem = zod.object({
+  "message": zod.object({
+  "id": zod.string(),
+  "senderId": zod.string(),
+  "receiverId": zod.string(),
+  "encryptedMessage": zod.string(),
+  "plainText": zod.string().nullish(),
+  "timer": zod.number().nullish(),
+  "expiresAt": zod.string().nullish(),
+  "isRead": zod.boolean().optional(),
+  "createdAt": zod.string()
+}),
+  "otherUser": zod.object({
+  "id": zod.string(),
+  "username": zod.string(),
+  "email": zod.string(),
+  "profilePicture": zod.string().nullish(),
+  "isOnline": zod.boolean().optional(),
+  "lastSeen": zod.string().nullish(),
+  "createdAt": zod.string()
+}),
+  "conversationUserId": zod.string(),
+  "snippet": zod.string().describe('Surrounding context with the matched term highlighted using \*\*markers\*\*')
+})
+export const SearchMessagesResponse = zod.array(SearchMessagesResponseItem)
+
+
+/**
  * @summary Send a message to another user
  */
 export const SendMessageBody = zod.object({

@@ -30,6 +30,8 @@ import type {
   MessageInput,
   OnlineUsers,
   RegisterInput,
+  SearchMessagesParams,
+  SearchResult,
   SuccessResponse,
   User
 } from './api.schemas';
@@ -723,6 +725,90 @@ export function useGetMessages<TData = Awaited<ReturnType<typeof getMessages>>, 
  ):  UseQueryResult<TData, TError> & { queryKey: QueryKey } {
 
   const queryOptions = getGetMessagesQueryOptions(userId,options)
+
+  const query = useQuery(queryOptions) as  UseQueryResult<TData, TError> & { queryKey: QueryKey };
+
+  return { ...query, queryKey: queryOptions.queryKey };
+}
+
+
+
+
+
+
+
+export const getSearchMessagesUrl = (params: SearchMessagesParams,) => {
+  const normalizedParams = new URLSearchParams();
+
+  Object.entries(params || {}).forEach(([key, value]) => {
+
+    if (value !== undefined) {
+      normalizedParams.append(key, value === null ? 'null' : value.toString())
+    }
+  });
+
+  const stringifiedParams = normalizedParams.toString();
+
+  return stringifiedParams.length > 0 ? `/api/messages/search?${stringifiedParams}` : `/api/messages/search`
+}
+
+/**
+ * @summary Search through the current user's message history
+ */
+export const searchMessages = async (params: SearchMessagesParams, options?: RequestInit): Promise<SearchResult[]> => {
+
+  return customFetch<SearchResult[]>(getSearchMessagesUrl(params),
+  {
+    ...options,
+    method: 'GET'
+
+
+  }
+);}
+
+
+
+
+
+export const getSearchMessagesQueryKey = (params?: SearchMessagesParams,) => {
+    return [
+    `/api/messages/search`, ...(params ? [params] : [])
+    ] as const;
+    }
+
+
+export const getSearchMessagesQueryOptions = <TData = Awaited<ReturnType<typeof searchMessages>>, TError = ErrorType<ErrorResponse>>(params: SearchMessagesParams, options?: { query?:UseQueryOptions<Awaited<ReturnType<typeof searchMessages>>, TError, TData>, request?: SecondParameter<typeof customFetch>}
+) => {
+
+const {query: queryOptions, request: requestOptions} = options ?? {};
+
+  const queryKey =  queryOptions?.queryKey ?? getSearchMessagesQueryKey(params);
+
+
+
+    const queryFn: QueryFunction<Awaited<ReturnType<typeof searchMessages>>> = ({ signal }) => searchMessages(params, { signal, ...requestOptions });
+
+
+
+
+
+   return  { queryKey, queryFn, ...queryOptions} as UseQueryOptions<Awaited<ReturnType<typeof searchMessages>>, TError, TData> & { queryKey: QueryKey }
+}
+
+export type SearchMessagesQueryResult = NonNullable<Awaited<ReturnType<typeof searchMessages>>>
+export type SearchMessagesQueryError = ErrorType<ErrorResponse>
+
+
+/**
+ * @summary Search through the current user's message history
+ */
+
+export function useSearchMessages<TData = Awaited<ReturnType<typeof searchMessages>>, TError = ErrorType<ErrorResponse>>(
+ params: SearchMessagesParams, options?: { query?:UseQueryOptions<Awaited<ReturnType<typeof searchMessages>>, TError, TData>, request?: SecondParameter<typeof customFetch>}
+
+ ):  UseQueryResult<TData, TError> & { queryKey: QueryKey } {
+
+  const queryOptions = getSearchMessagesQueryOptions(params,options)
 
   const query = useQuery(queryOptions) as  UseQueryResult<TData, TError> & { queryKey: QueryKey };
 
